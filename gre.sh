@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-VERSION=1.1.0
+VERSION=1.2.0
 BASE=/etc/wilson-gre
 RUN=/run/wilson-gre
 LOG=/var/log/wilson-gre.log
@@ -23,7 +23,11 @@ KEYS=(ROLE LOCAL_IP CLIENT_IP PEER_IP WAN GRE_NET MTU MODE TCP_PORTS UDP_PORTS M
 say() { printf '%s\n' "$*"; }
 log() { printf '%(%FT%T%z)T %s\n' -1 "$*" | tee -a "$LOG"; }
 die() { say "ERROR: $*" >&2; exit 1; }
-need() { command -v "$1" >/dev/null || die "Missing dependency: $1"; }
+need() {
+    command -v "$1" >/dev/null && return
+    say 'Ubuntu/Debian dependencies: apt-get update && apt-get install -y iproute2 iptables conntrack iputils-ping util-linux' >&2
+    die "Missing dependency: $1 (install it, then retry)"
+}
 ipt() { command iptables -w 10 "$@"; }
 ipv4() {
     local s=$1 a b c d x
@@ -71,6 +75,12 @@ validate() {
     [[ ,${C[MANAGEMENT]}, == *,22,* ]] || die 'MANAGEMENT must contain 22 and all custom management ports'
     if [[ ${C[MODE]} == ports ]]; then
         [[ ${C[TCP_PORTS]} != - || ${C[UDP_PORTS]} != - ]] || die 'Choose at least one port'
+        local protected
+        local -a management_ports
+        IFS=, read -r -a management_ports <<< "${C[MANAGEMENT]}"
+        for protected in "${management_ports[@]}"; do
+            [[ ,${C[TCP_PORTS]}, != *,$protected,* && ,${C[UDP_PORTS]}, != *,$protected,* ]] || die "Port $protected is also a protected management port; remove it from forwarded ports"
+        done
     fi
     if [[ ${C[ROLE]} == IRAN ]]; then
         INNER=$(ipstr "$((n+2))"); OTHER=$(ipstr "$((n+1))")
@@ -92,30 +102,97 @@ load_config() {
 }
 write_config() { local k; for k in "${KEYS[@]}"; do printf '%s=%s\n' "$k" "${C[$k]}"; done; }
 ask() { local v; read -r -p "$2 [$3]: " v </dev/tty; C[$1]=${v:-$3}; }
+normalize_ports() {
+    local raw=${1// /} p
+    local -a values
+    [[ $raw != - && -n $raw ]] || { printf '%s\n' -; return; }
+    [[ $raw =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || return 1
+    IFS=, read -r -a values <<< "$raw"
+    for p in "${values[@]}"; do
+        [[ ${#p} -le 5 ]] && ((p<=65535)) || return 1
+    done
+    printf '%s\n' "${values[@]}" | sort -nu | paste -sd, -
+}
+ask_ports() {
+    local value
+    while :; do
+        ask "$1" "$2" "$3"
+        if value=$(normalize_ports "${C[$1]}") && ports "$value"; then C[$1]=$value; return; fi
+        say 'Enter ports such as 7070,9090 or - for none.'
+    done
+}
+prepare_sshd_runtime() {
+    # /run is cleared at boot. sshd -T needs this even before ssh.service starts.
+    if [[ ! -e /run/sshd && ! -L /run/sshd ]]; then
+        install -d -o root -g root -m 0755 /run/sshd
+    fi
+    [[ -d /run/sshd && ! -L /run/sshd ]] || die 'Unsafe /run/sshd path'
+}
 configure() {
-    [[ ! -f $RUN/journal ]] || die 'Stop before configuring; resolve any pending cleanup first'
+    [[ ! -f $RUN/journal ]] || die 'Choose Stop first, then configure again'
     [[ ! -f $BASE/config ]] || load_config
-    say 'Wilson GRE | same ports on FOREIGN tunnel IP; IPv4 only'
-    say 'Lists: ascending comma-separated ports; - means none. Include every SSH/admin port.'
-    ask ROLE 'Role: IRAN / FOREIGN' "${C[ROLE]:-IRAN}"
-    ask LOCAL_IP 'Local outer IPv4 (must be assigned on this server)' "${C[LOCAL_IP]:-}"
+    local role route detected answer sshcfg sshport admins=22 key
+    say '--- Wilson GRE: guided setup ---'
+    say '1 = IRAN (users connect here); 2 = FOREIGN (VPN service runs here)'
+    while :; do
+        ask ROLE 'This server: 1 / 2' "${C[ROLE]:-1}"
+        role=${C[ROLE]^^}
+        case $role in 1|IRAN) C[ROLE]=IRAN; break;; 2|FOREIGN) C[ROLE]=FOREIGN; break;; esac
+        say 'Choose 1 or 2, not an IP address.'
+    done
+    say 'Addresses currently assigned to this server:'
+    ip -4 -o addr show scope global | awk '{print "  " $2 ": " $4}'
+    for key in LOCAL_IP PEER_IP; do
+        if [[ $key == LOCAL_IP ]]; then
+            detected='THIS server IP for the tunnel'
+        else detected='OTHER server IP for the tunnel'; fi
+        while :; do
+            ask "$key" "$detected" "${C[$key]:-}"
+            ipv4 "${C[$key]}" && break
+            say 'Enter a valid IPv4 address.'
+        done
+    done
     if [[ ${C[ROLE]} == IRAN ]]; then
-        ask CLIENT_IP 'Public IPv4 that clients connect to (may differ from GRE endpoint)' "${C[CLIENT_IP]:-${C[LOCAL_IP]}}"
+        say 'With two IPs: tunnel IP above, user connection IP below.'
+        ask CLIENT_IP 'IP that users connect to' "${C[CLIENT_IP]:-${C[LOCAL_IP]}}"
     else C[CLIENT_IP]=${C[LOCAL_IP]}; fi
-    ask PEER_IP 'Peer outer IPv4' "${C[PEER_IP]:-}"
-    ask WAN 'Interface used to reach peer and receive clients' "${C[WAN]:-eth0}"
-    ask GRE_NET 'Private /30 network (same on both servers)' "${C[GRE_NET]:-10.200.200.0/30}"
-    ask MTU 'Inner MTU (outer path MTU minus 24; lower for upstream VPN)' "${C[MTU]:-1476}"
-    ask MODE 'Forward ports / all (same on both servers)' "${C[MODE]:-ports}"
-    ask TCP_PORTS 'TCP ports' "${C[TCP_PORTS]:-443}"
-    ask UDP_PORTS 'UDP ports' "${C[UDP_PORTS]:-443}"
-    ask MANAGEMENT 'Excluded management ports (TCP AND UDP)' "${C[MANAGEMENT]:-22}"
+    route=$(ip -4 route get "${C[PEER_IP]}" from "${C[LOCAL_IP]}" 2>/dev/null) || die 'No route to peer from this IP; check the addresses'
+    detected=$(awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}' <<< "$route")
+    C[WAN]=${C[WAN]:-$detected}
+    C[GRE_NET]=${C[GRE_NET]:-10.200.200.0/30}
+    C[MTU]=${C[MTU]:-1476}
+    detected=$(cat "/sys/class/net/${C[WAN]}/mtu")
+    if ((C[MTU]>detected-24)); then C[MTU]=$((detected-24)); fi
+    ask MODE 'Forward selected ports or all TCP/UDP? ports / all' "${C[MODE]:-ports}"
+    C[MODE]=${C[MODE],,}
+    if [[ ${C[MODE]} == ports ]]; then
+        ask_ports TCP_PORTS 'VPN TCP ports (example: 7070,9090)' "${C[TCP_PORTS]:-7070,9090}"
+        ask_ports UDP_PORTS 'UDP ports (- = disabled)' "${C[UDP_PORTS]:--}"
+    else C[TCP_PORTS]=-; C[UDP_PORTS]=-; fi
+    if command -v sshd >/dev/null; then
+        prepare_sshd_runtime
+        sshcfg=$(sshd -T) || die 'Cannot read SSH settings; run sshd -T to inspect the error'
+        while read -r sshport; do admins+=",$sshport"; done < <(awk '$1=="port"{print $2}' <<< "$sshcfg")
+    fi
+    [[ -z ${SSH_CONNECTION:-} ]] || admins+=",${SSH_CONNECTION##* }"
+    admins=$(normalize_ports "$admins,${C[MANAGEMENT]:-22}")
+    ask_ports MANAGEMENT 'Protected SSH/admin ports (never forwarded)' "$admins"
+    read -r -p 'Advanced network settings? y/N: ' answer </dev/tty
+    if [[ ${answer,,} == y ]]; then
+        ask WAN 'Network interface' "${C[WAN]}"
+        ask GRE_NET 'Private /30 (same on both servers)' "${C[GRE_NET]}"
+        ask MTU 'Tunnel MTU' "${C[MTU]}"
+    fi
     validate
+    say "Role: ${C[ROLE]} | Tunnel: ${C[LOCAL_IP]} -> ${C[PEER_IP]}"
+    say "Users connect to: ${C[CLIENT_IP]} | TCP: ${C[TCP_PORTS]} | UDP: ${C[UDP_PORTS]} | Mode: ${C[MODE]}"
+    say "Protected: ${C[MANAGEMENT]} | Interface: ${C[WAN]} | MTU: ${C[MTU]}"
     if [[ ${C[MODE]} == all ]]; then
-        local answer
         read -r -p 'Expose all non-management TCP/UDP services on FOREIGN? Type ALL: ' answer </dev/tty
         [[ $answer == ALL ]] || die 'Cancelled'
     fi
+    read -r -p 'Save these settings? Y/n: ' answer </dev/tty
+    [[ ${answer,,} != n ]] || die 'Cancelled'
     write_config > "$BASE/config.new"
     mv -f "$BASE/config.new" "$BASE/config"
     log 'Configuration saved; start FOREIGN, then IRAN.'
@@ -230,6 +307,7 @@ preflight() {
     fi
     if command -v sshd >/dev/null; then
         local sshcfg
+        prepare_sshd_runtime
         sshcfg=$(sshd -T) || die 'Cannot inspect sshd configuration; resolve sshd -T errors first'
         while read -r sshport; do
             [[ ,${C[MANAGEMENT]}, == *,$sshport,* ]] || die "sshd port $sshport is missing from MANAGEMENT"
@@ -285,6 +363,8 @@ build_firewall() {
         # The different current and original addresses prove DNAT in stateful rules.
         # DNAT is a virtual --ctstate, NOT a --ctstatus.
         rule filter WG_FORWARD -i "$TUN" -o "${C[WAN]}" -s "$OTHER" -m conntrack --ctstate ESTABLISHED,RELATED --ctorigdst "${C[CLIENT_IP]}" --ctdir REPLY -j ACCEPT
+        # ICMP errors belonging to an existing relay connection need the forward path too.
+        rule filter WG_FORWARD -i "${C[WAN]}" -o "$TUN" -d "$OTHER" -p icmp -m conntrack --ctstate RELATED --ctorigdst "${C[CLIENT_IP]}" --ctdir ORIGINAL -j ACCEPT
         exclusions filter WG_FORWARD
         for proto in tcp udp; do
             key=${proto^^}_PORTS
@@ -341,10 +421,15 @@ start() {
 }
 stop() { cleanup; log 'Stopped; owned hooks, chains and tunnel removed. Host settings retained.'; }
 health() {
-    local kind table name
+    local kind table name tunnel
     local -a f
     [[ -f $RUN/journal && -e /sys/class/net/$TUN ]] || return 1
     [[ $(cat "/sys/class/net/$TUN/ifalias") == "$OWNER" ]] || return 1
+    load_config "$RUN/config"
+    [[ $(cat "/sys/class/net/$TUN/mtu") == "${C[MTU]}" ]] || return 1
+    ip -4 -o addr show dev "$TUN" | awk '{print $4}' | grep -Fxq "$INNER/30" || return 1
+    tunnel=$(ip tunnel show "$TUN") || return 1
+    [[ $tunnel == *"remote ${C[PEER_IP]} local ${C[LOCAL_IP]} dev ${C[WAN]} "* ]] || return 1
     while IFS=$'\t' read -r -a f; do
         kind=${f[0]}; table=${f[1]:-}; name=${f[2]:-}
         case $kind in
@@ -400,7 +485,7 @@ install_service() {
 [Unit]
 Description=Wilson GRE IPv4 port relay
 Wants=network-online.target
-After=network-online.target ufw.service firewalld.service docker.service
+After=network-online.target ufw.service firewalld.service docker.service ssh.service sshd.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
@@ -438,6 +523,7 @@ service_action() {
 setup() {
     need systemctl
     [[ -d /run/systemd/system ]] || die 'Automatic boot requires systemd; use configure/start for manual mode'
+    need conntrack
     configure
     if [[ ! -e $UNIT ]]; then install_service
     else grep -Fxq '# Wilson GRE managed unit' "$UNIT" || die 'Service name is already in use'; fi
@@ -476,7 +562,7 @@ main() {
     [[ ${1:-} != --version ]] || { say "Wilson GRE $VERSION"; return; }
     [[ $(uname -s) == Linux ]] || die 'Linux required'
     ((EUID == 0)) || die 'Run as root (sudo -i, then run the command)'
-    for cmd in flock tee awk cut grep cmp install mktemp ip iptables sysctl; do need "$cmd"; done
+    for cmd in flock tee awk cut grep cmp install mktemp ip iptables sysctl sort paste; do need "$cmd"; done
     [[ ! -L $BASE && ! -L $RUN && ! -L $LOG ]] || die 'Unsafe symlink in runtime paths'
     install -d -o root -g root -m 0700 "$BASE" "$RUN"
     touch "$LOG"; chmod 0600 "$LOG"
@@ -492,7 +578,7 @@ main() {
     local -a actions=(setup start stop restart status diagnostics install-service uninstall-service configure)
     while :; do
         if [[ -t 1 ]]; then printf '\033[1;36m'; fi
-        printf '\n  ╔══════════════════════════════╗\n  ║       WILSON GRE  1.1        ║\n  ╚══════════════════════════════╝\n'
+        printf '\n  ╔══════════════════════════════╗\n  ║       WILSON GRE  1.2        ║\n  ╚══════════════════════════════╝\n'
         if [[ -t 1 ]]; then printf '\033[0m'; fi
         say '  1 Setup + auto boot    2 Start      3 Stop'
         say '  4 Restart       5 Status     6 Diagnostics'
