@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-VERSION=1.0.0
+VERSION=1.1.0
 BASE=/etc/wilson-gre
 RUN=/run/wilson-gre
 LOG=/var/log/wilson-gre.log
@@ -18,7 +18,7 @@ TX=0
 INSTALL_TX=0
 TEMP=''
 declare -gA C=()
-KEYS=(ROLE LOCAL_IP PEER_IP WAN GRE_NET MTU MODE TCP_PORTS UDP_PORTS MANAGEMENT)
+KEYS=(ROLE LOCAL_IP CLIENT_IP PEER_IP WAN GRE_NET MTU MODE TCP_PORTS UDP_PORTS MANAGEMENT)
 
 say() { printf '%s\n' "$*"; }
 log() { printf '%(%FT%T%z)T %s\n' -1 "$*" | tee -a "$LOG"; }
@@ -50,16 +50,21 @@ ports() {
 }
 validate() {
     local k n a b
+    C[CLIENT_IP]=${C[CLIENT_IP]:-${C[LOCAL_IP]:-}}
     for k in "${KEYS[@]}"; do [[ -n ${C[$k]:-} ]] || die "Missing $k"; done
     [[ ${C[ROLE]} == IRAN || ${C[ROLE]} == FOREIGN ]] || die 'ROLE must be IRAN or FOREIGN'
     ipv4 "${C[LOCAL_IP]}" || die 'Invalid LOCAL_IP'; a=$IPNUM
     ipv4 "${C[PEER_IP]}" || die 'Invalid PEER_IP'; b=$IPNUM
     ((a != b && (a>>24)>0 && (a>>24)<224 && (a>>24)!=127 && (b>>24)>0 && (b>>24)<224 && (b>>24)!=127)) || die 'Invalid endpoints'
+    ipv4 "${C[CLIENT_IP]}" || die 'Invalid CLIENT_IP'
+    (( (IPNUM>>24)>0 && (IPNUM>>24)<224 && (IPNUM>>24)!=127 )) || die 'Invalid client-facing address'
     [[ ${C[WAN]} =~ ^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,14}$ && ${C[WAN]} != "$TUN" ]] || die 'Invalid WAN interface'
     [[ ${C[GRE_NET]} == */30 ]] || die 'GRE_NET must be a private /30 network'
     ipv4 "${C[GRE_NET]%/30}" || die 'Invalid GRE_NET'; n=$IPNUM
     (( (n&3)==0 && ( (n>>24)==10 || (n>>20)==2753 || (n>>16)==49320 ) )) || die 'Use an aligned RFC1918 /30 network'
     ((a < n || a > n+3)) && ((b < n || b > n+3)) || die 'Outer endpoints overlap GRE network'
+    ipv4 "${C[CLIENT_IP]}"
+    ((IPNUM < n || IPNUM > n+3)) || die 'CLIENT_IP overlaps GRE network'
     [[ ${C[MTU]} =~ ^[1-9][0-9]{2,3}$ ]] && ((C[MTU]>=576 && C[MTU]<=1476)) || die 'MTU must be 576..1476'
     [[ ${C[MODE]} == ports || ${C[MODE]} == all ]] || die 'MODE must be ports or all'
     for k in TCP_PORTS UDP_PORTS MANAGEMENT; do ports "${C[$k]}" || die "$k: use ascending unique ports, comma-separated, or -"; done
@@ -94,6 +99,9 @@ configure() {
     say 'Lists: ascending comma-separated ports; - means none. Include every SSH/admin port.'
     ask ROLE 'Role: IRAN / FOREIGN' "${C[ROLE]:-IRAN}"
     ask LOCAL_IP 'Local outer IPv4 (must be assigned on this server)' "${C[LOCAL_IP]:-}"
+    if [[ ${C[ROLE]} == IRAN ]]; then
+        ask CLIENT_IP 'Public IPv4 that clients connect to (may differ from GRE endpoint)' "${C[CLIENT_IP]:-${C[LOCAL_IP]}}"
+    else C[CLIENT_IP]=${C[LOCAL_IP]}; fi
     ask PEER_IP 'Peer outer IPv4' "${C[PEER_IP]:-}"
     ask WAN 'Interface used to reach peer and receive clients' "${C[WAN]:-eth0}"
     ask GRE_NET 'Private /30 network (same on both servers)' "${C[GRE_NET]:-10.200.200.0/30}"
@@ -195,6 +203,9 @@ preflight() {
     for a in ip iptables sysctl; do need "$a"; done
     [[ ! -e /sys/class/net/$TUN ]] || die "Interface $TUN already exists without a usable active state"
     ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "${C[LOCAL_IP]}" || die 'LOCAL_IP is not assigned locally; automatic NAT traversal is unsupported'
+    if [[ ${C[ROLE]} == IRAN ]]; then
+        ip -4 -o addr show dev "${C[WAN]}" | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "${C[CLIENT_IP]}" || die 'CLIENT_IP must be assigned on WAN'
+    fi
     route=$(ip -4 route get "${C[PEER_IP]}" from "${C[LOCAL_IP]}")
     dev=$(awk '{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}' <<< "$route")
     [[ $dev == "${C[WAN]}" ]] || die "Peer route uses $dev, configured WAN is ${C[WAN]}"
@@ -256,8 +267,8 @@ build_firewall() {
     rule filter WG_GUARD -i "$TUN" ! -d "$INNER" -j DROP
     # Restrict transit before broad ACCEPT rules installed by other software.
     if [[ ${C[ROLE]} == IRAN ]]; then
-        rule filter WG_TRANSIT -i "$TUN" -s "$OTHER" -m conntrack --ctstate ESTABLISHED,RELATED --ctorigdst "${C[LOCAL_IP]}" --ctdir REPLY -j RETURN
-        rule filter WG_TRANSIT -o "$TUN" -d "$OTHER" -m conntrack --ctstate DNAT --ctorigdst "${C[LOCAL_IP]}" --ctdir ORIGINAL -j RETURN
+        rule filter WG_TRANSIT -i "$TUN" -s "$OTHER" -m conntrack --ctstate ESTABLISHED,RELATED --ctorigdst "${C[CLIENT_IP]}" --ctdir REPLY -j RETURN
+        rule filter WG_TRANSIT -o "$TUN" -d "$OTHER" -m conntrack --ctstate DNAT --ctorigdst "${C[CLIENT_IP]}" --ctdir ORIGINAL -j RETURN
     fi
     rule filter WG_TRANSIT -i "$TUN" -j DROP
     rule filter WG_TRANSIT -o "$TUN" -j DROP
@@ -273,18 +284,18 @@ build_firewall() {
     else
         # The different current and original addresses prove DNAT in stateful rules.
         # DNAT is a virtual --ctstate, NOT a --ctstatus.
-        rule filter WG_FORWARD -i "$TUN" -o "${C[WAN]}" -s "$OTHER" -m conntrack --ctstate ESTABLISHED,RELATED --ctorigdst "${C[LOCAL_IP]}" --ctdir REPLY -j ACCEPT
+        rule filter WG_FORWARD -i "$TUN" -o "${C[WAN]}" -s "$OTHER" -m conntrack --ctstate ESTABLISHED,RELATED --ctorigdst "${C[CLIENT_IP]}" --ctdir REPLY -j ACCEPT
         exclusions filter WG_FORWARD
         for proto in tcp udp; do
             key=${proto^^}_PORTS
-            port_rules filter WG_FORWARD "$proto" "$key" -i "${C[WAN]}" -o "$TUN" -d "$OTHER" -m conntrack --ctstate NEW,ESTABLISHED --ctorigdst "${C[LOCAL_IP]}" --ctdir ORIGINAL -j ACCEPT
+            port_rules filter WG_FORWARD "$proto" "$key" -i "${C[WAN]}" -o "$TUN" -d "$OTHER" -m conntrack --ctstate NEW,ESTABLISHED --ctorigdst "${C[CLIENT_IP]}" --ctdir ORIGINAL -j ACCEPT
         done
         exclusions nat WG_DNAT
         for proto in tcp udp; do
             key=${proto^^}_PORTS
-            port_rules nat WG_DNAT "$proto" "$key" -i "${C[WAN]}" -d "${C[LOCAL_IP]}" -j DNAT --to-destination "$OTHER"
+            port_rules nat WG_DNAT "$proto" "$key" -i "${C[WAN]}" -d "${C[CLIENT_IP]}" -j DNAT --to-destination "$OTHER"
         done
-        rule nat WG_SNAT -o "$TUN" -d "$OTHER" -m conntrack --ctstate DNAT --ctorigdst "${C[LOCAL_IP]}" -j SNAT --to-source "$INNER"
+        rule nat WG_SNAT -o "$TUN" -d "$OTHER" -m conntrack --ctstate DNAT --ctorigdst "${C[CLIENT_IP]}" -j SNAT --to-source "$INNER"
     fi
     # Fixed upper MSS also handles SYN-ACKs whose return route has a larger MTU.
     for n in -i -o; do
@@ -315,7 +326,8 @@ start() {
     cp "$BASE/config" "$RUN/config"
     record link "$TUN"
     ip link add name "$TUN" alias "$OWNER" type gre local "${C[LOCAL_IP]}" remote "${C[PEER_IP]}" dev "${C[WAN]}" ttl 64 pmtudisc
-    if [[ ${C[ROLE]} == IRAN ]]; then record conntrack "${C[LOCAL_IP]}" "$OTHER" "$INNER"; fi
+    ip link set dev "$TUN" alias "$OWNER"
+    if [[ ${C[ROLE]} == IRAN ]]; then record conntrack "${C[CLIENT_IP]}" "$OTHER" "$INNER"; fi
     ip addr add "$INNER/30" dev "$TUN"
     # Interface-specific only; never overwrite host-wide routing/firewall tuning.
     sysctl -q -w "net.ipv4.conf.$TUN.rp_filter=2"
@@ -480,7 +492,7 @@ main() {
     local -a actions=(setup start stop restart status diagnostics install-service uninstall-service configure)
     while :; do
         if [[ -t 1 ]]; then printf '\033[1;36m'; fi
-        printf '\n  ╔══════════════════════════════╗\n  ║       WILSON GRE  1.0        ║\n  ╚══════════════════════════════╝\n'
+        printf '\n  ╔══════════════════════════════╗\n  ║       WILSON GRE  1.1        ║\n  ╚══════════════════════════════╝\n'
         if [[ -t 1 ]]; then printf '\033[0m'; fi
         say '  1 Setup + auto boot    2 Start      3 Stop'
         say '  4 Restart       5 Status     6 Diagnostics'
