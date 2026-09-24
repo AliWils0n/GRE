@@ -80,6 +80,9 @@ ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$LOCAL" || die 
 if [[ $LOCATION == 1 ]]; then
     ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$CLIENT" || die 'Client IP is not assigned locally.'
 fi
+route=$(ip -4 route get "$PEER" from "$LOCAL")
+WAN=$(awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}' <<< "$route")
+[[ -n $WAN && $WAN != "$TUN" ]] || die 'Cannot determine the public interface.'
 [[ -z $(ip -4 route show exact 10.200.200.0/30) ]] || die 'Tunnel subnet is already routed.'
 trap rollback EXIT
 trap 'exit 130' INT
@@ -102,9 +105,12 @@ if [[ $LOCATION == 1 ]]; then
         for p in "${ADMIN[@]}"; do
             ipt -t nat -A VGS_DNAT -p "$proto" --dport "$p" -j RETURN
         done
+        # Match every local IPv4 on the public ingress interface, not transit traffic.
         ipt -t nat -A VGS_DNAT -d "$CLIENT" -p "$proto" -j DNAT --to-destination "$OTHER"
+        ipt -t nat -A VGS_DNAT -i "$WAN" -m addrtype --dst-type LOCAL -p "$proto" -j DNAT --to-destination "$OTHER"
     done
     ipt -t nat -A VGS_SNAT -o "$TUN" -d "$OTHER" -m conntrack --ctstate DNAT --ctorigdst "$CLIENT" -j SNAT --to-source "$INNER"
+    ipt -t nat -A VGS_SNAT -o "$TUN" -d "$OTHER" -m conntrack --ctstate DNAT -j SNAT --to-source "$INNER"
     ipt -t nat -A PREROUTING -m comment --comment "$OWNER" -j VGS_DNAT
     ipt -t nat -A POSTROUTING -m comment --comment "$OWNER" -j VGS_SNAT
 fi
@@ -112,3 +118,6 @@ ip link set dev "$TUN" up
 TX=0
 printf '\nConfigured %s -> %s, MTU 1250. Test: ping -c 3 %s\n' "$INNER" "$OTHER" "$OTHER"
 printf 'Manual setup only: no automatic boot. Existing firewall policies are unchanged.\n'
+if [[ $LOCATION == 1 ]]; then
+    printf 'All local IPv4 addresses on %s relay TCP/UDP, except protected management ports.\n' "$WAN"
+fi
